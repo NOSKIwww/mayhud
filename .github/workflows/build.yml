@@ -13,13 +13,21 @@ jobs:
       - name: Create tweak files
         run: |
           cat > Tweak.m <<'MAYEOF'
-          // MayHUD — status-bar widgets (time, date, battery, custom text) drawn by a
-          // click-through window inside SpringBoard. No private APIs, no extra process.
+          // MayHUD 0.2 - Helium-style widget sets drawn inside SpringBoard.
+          // 3 widget sets x 4 widgets: date, time, text, network speed, device temperature,
+          // battery details, battery capacity, charging symbol, weather (QWeather).
           #import <UIKit/UIKit.h>
           #import <QuartzCore/QuartzCore.h>
+          #include <ifaddrs.h>
+          #include <net/if.h>
+          #include <sys/socket.h>
+          #include <dlfcn.h>
+          #include <mach/mach.h>
           #include <math.h>
 
           #define kDomain CFSTR("local.mayhud")
+          #define NSETS 3
+          #define NSLOTS 4
 
           @interface MHWindow : UIWindow
           @end
@@ -29,68 +37,280 @@ jobs:
           @end
 
           static MHWindow *gWin;
-          static UILabel *gLabels[3];                 // left, center, right
-          static NSString *gTypes[3], *gCustom[3];
-          static NSDateFormatter *gTimeF, *gTimeSecF, *gDateF;
+          static UIView *gCont[NSETS];
+          static UIVisualEffectView *gBlur[NSETS];
+          static UILabel *gLab[NSETS];
+          static NSTimeInterval gLast[NSETS];
+          static NSDictionary *gP;
           static NSTimer *gTimer;
           static int gTick = 0;
+          static NSMutableDictionary<NSString *, NSDateFormatter *> *gFmt;
 
           #pragma mark - Preferences
 
-          static NSString *prefString(NSString *key, NSString *def) {
-              CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, kDomain);
-              NSString *r = def;
-              if (v) { if (CFGetTypeID(v) == CFStringGetTypeID()) r = [(__bridge NSString *)v copy]; CFRelease(v); }
-              return r;
+          static NSString *ps(NSString *k, NSString *d) { id v = gP[k]; return [v isKindOfClass:NSString.class] ? v : d; }
+          static BOOL pb(NSString *k, BOOL d) { id v = gP[k]; return [v isKindOfClass:NSNumber.class] ? [v boolValue] : d; }
+          static double pd(NSString *k, double d) { id v = gP[k]; return [v isKindOfClass:NSNumber.class] ? [v doubleValue] : d; }
+          static NSString *SK(int i, NSString *n) { return [NSString stringWithFormat:@"s%d_%@", i, n]; }
+          static NSString *WK(int i, int j, NSString *n) { return [NSString stringWithFormat:@"s%dw%d_%@", i, j, n]; }
+
+          static void loadPrefs(void) {
+              CFPreferencesAppSynchronize(kDomain);
+              CFDictionaryRef d = CFPreferencesCopyMultiple(NULL, kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+              gP = d ? (__bridge_transfer NSDictionary *)d : @{};
           }
-          static BOOL prefBool(NSString *key, BOOL def) {
-              CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, kDomain);
-              BOOL r = def;
-              if (v) {
-                  if (CFGetTypeID(v) == CFBooleanGetTypeID()) r = CFBooleanGetValue(v);
-                  else if (CFGetTypeID(v) == CFNumberGetTypeID()) { int n = 0; CFNumberGetValue(v, kCFNumberIntType, &n); r = n != 0; }
-                  CFRelease(v);
+
+          #pragma mark - IOKit battery info (loaded dynamically)
+
+          typedef CFMutableDictionaryRef (*MHMatchFn)(const char *);
+          typedef mach_port_t (*MHGetFn)(mach_port_t, CFDictionaryRef);
+          typedef kern_return_t (*MHPropsFn)(mach_port_t, CFMutableDictionaryRef *, CFAllocatorRef, uint32_t);
+          typedef kern_return_t (*MHRelFn)(mach_port_t);
+
+          static NSDictionary *batteryInfo(void) {
+              static NSDictionary *cache;
+              static NSTimeInterval last;
+              static void *h;
+              static MHMatchFn fMatch; static MHGetFn fGet; static MHPropsFn fProps; static MHRelFn fRel;
+              NSTimeInterval now = CACurrentMediaTime();
+              if (cache && now - last < 2.0) return cache;
+              if (!h) {
+                  h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+                  if (h) {
+                      fMatch = (MHMatchFn)dlsym(h, "IOServiceMatching");
+                      fGet   = (MHGetFn)dlsym(h, "IOServiceGetMatchingService");
+                      fProps = (MHPropsFn)dlsym(h, "IORegistryEntryCreateCFProperties");
+                      fRel   = (MHRelFn)dlsym(h, "IOObjectRelease");
+                  }
               }
-              return r;
-          }
-          static double prefDouble(NSString *key, double def) {
-              CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, kDomain);
-              double r = def;
-              if (v) { if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue(v, kCFNumberDoubleType, &r); CFRelease(v); }
-              return r;
+              if (!fMatch || !fGet || !fProps || !fRel) return cache;
+              mach_port_t s = fGet(0, fMatch("AppleSmartBattery"));
+              if (!s) return cache;
+              CFMutableDictionaryRef props = NULL;
+              if (fProps(s, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+                  cache = (__bridge_transfer NSDictionary *)props;
+                  last = now;
+              }
+              fRel(s);
+              return cache;
           }
 
-          #pragma mark - Text
+          static double binfo(NSString *key, double def) {
+              id v = batteryInfo()[key];
+              return [v isKindOfClass:NSNumber.class] ? [v doubleValue] : def;
+          }
 
-          static NSString *batteryString(void) {
+          static BOOL isCharging(void) {
               UIDevice *d = UIDevice.currentDevice;
               d.batteryMonitoringEnabled = YES;
-              float l = d.batteryLevel;
-              if (l < 0) return @"--%";
-              NSString *s = [NSString stringWithFormat:@"%d%%", (int)lroundf(l * 100)];
-              if (d.batteryState == UIDeviceBatteryStateCharging) s = [@"⚡ " stringByAppendingString:s];
-              return s;
+              return d.batteryState == UIDeviceBatteryStateCharging;
           }
 
-          static NSString *textFor(NSString *type, NSString *custom) {
-              NSDate *now = [NSDate date];
-              if ([type isEqualToString:@"time"])    return [gTimeF stringFromDate:now];
-              if ([type isEqualToString:@"timesec"]) return [gTimeSecF stringFromDate:now];
-              if ([type isEqualToString:@"date"])    return [gDateF stringFromDate:now];
-              if ([type isEqualToString:@"battery"]) return batteryString();
-              if ([type isEqualToString:@"custom"]) {
-                  NSString *t = custom ?: @"";
-                  t = [t stringByReplacingOccurrencesOfString:@"{time}" withString:[gTimeF stringFromDate:now]];
-                  t = [t stringByReplacingOccurrencesOfString:@"{date}" withString:[gDateF stringFromDate:now]];
-                  t = [t stringByReplacingOccurrencesOfString:@"{battery}" withString:batteryString()];
-                  return t;
+          #pragma mark - Network speed
+
+          static double gDown[2], gUp[2];                 // 0 = Wi-Fi, 1 = cellular
+          static uint32_t gPrevIn[2], gPrevOut[2];
+          static NSTimeInterval gPrevT;
+          static BOOL gHavePrev;
+
+          static void sampleNet(void) {
+              struct ifaddrs *list = NULL;
+              if (getifaddrs(&list) != 0) return;
+              uint32_t in[2] = {0, 0}, out[2] = {0, 0};
+              for (struct ifaddrs *a = list; a; a = a->ifa_next) {
+                  if (!a->ifa_addr || a->ifa_addr->sa_family != AF_LINK || !a->ifa_data) continue;
+                  int idx = -1;
+                  if (strcmp(a->ifa_name, "en0") == 0) idx = 0;
+                  else if (strncmp(a->ifa_name, "pdp_ip", 6) == 0) idx = 1;
+                  if (idx < 0) continue;
+                  struct if_data *d = (struct if_data *)a->ifa_data;
+                  in[idx] += d->ifi_ibytes;
+                  out[idx] += d->ifi_obytes;
               }
-              return @"";
+              freeifaddrs(list);
+              NSTimeInterval now = CACurrentMediaTime();
+              if (gHavePrev && now - gPrevT > 0.2) {
+                  for (int i = 0; i < 2; i++) {
+                      gDown[i] = (double)(uint32_t)(in[i] - gPrevIn[i]) / (now - gPrevT);
+                      gUp[i]   = (double)(uint32_t)(out[i] - gPrevOut[i]) / (now - gPrevT);
+                  }
+              }
+              for (int i = 0; i < 2; i++) { gPrevIn[i] = in[i]; gPrevOut[i] = out[i]; }
+              gPrevT = now;
+              gHavePrev = YES;
           }
 
-          static void tick(void) {
-              if (!gWin || gWin.hidden) return;
-              for (int i = 0; i < 3; i++) gLabels[i].text = textFor(gTypes[i], gCustom[i]);
+          static NSString *speedString(double bps, int minUnit) {
+              static const char *u[] = {"B/s", "KB/s", "MB/s", "GB/s"};
+              int idx = 0;
+              double v = bps;
+              while (idx < minUnit) { v /= 1024.0; idx++; }
+              while (v >= 1024.0 && idx < 3) { v /= 1024.0; idx++; }
+              return [NSString stringWithFormat:(idx == 0 ? @"%.0f %s" : @"%.1f %s"), v, u[idx]];
+          }
+
+          #pragma mark - Weather (QWeather)
+
+          static NSDictionary *gWeather;
+          static NSString *gWeatherSig;
+          static NSTimeInterval gWeatherT;
+          static BOOL gWeatherBusy;
+
+          static void fetchWeather(NSString *loc) {
+              NSString *key = ps(@"weatherApiKey", @"");
+              if (key.length == 0 || loc.length == 0 || gWeatherBusy) return;
+              NSString *sig = [NSString stringWithFormat:@"%@|%@", loc, key];
+              NSTimeInterval now = CACurrentMediaTime();
+              BOOL same = [sig isEqualToString:gWeatherSig];
+              if (same && gWeather && now - gWeatherT < 600) return;
+              if (same && !gWeather && now - gWeatherT < 30) return;
+              gWeatherBusy = YES;
+              gWeatherSig = sig;
+              gWeatherT = now;
+              NSString *q = [loc stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
+              NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://devapi.qweather.com/v7/weather/now?location=%@&key=%@&lang=en", q, key]];
+              if (!url) { gWeatherBusy = NO; return; }
+              [[NSURLSession.sharedSession dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+                  id j = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      gWeatherBusy = NO;
+                      NSDictionary *n = [j isKindOfClass:NSDictionary.class] ? j[@"now"] : nil;
+                      if ([n isKindOfClass:NSDictionary.class]) gWeather = n;
+                  });
+              }] resume];
+          }
+
+          static NSString *weatherEmoji(NSString *code) {
+              int c = code.intValue;
+              if (c == 100) return @"☀️";
+              if (c >= 101 && c <= 103) return @"⛅";
+              if (c == 104 || (c >= 151 && c <= 153)) return @"☁️";
+              if (c == 150) return @"🌙";
+              if (c >= 300 && c <= 399) return @"🌧️";
+              if (c >= 400 && c <= 499) return @"🌨️";
+              if (c >= 500 && c <= 515) return @"🌫️";
+              return @"🌡️";
+          }
+
+          static NSString *weatherText(NSString *fmt) {
+              NSDictionary *w = gWeather;
+              if (!w) return @"…";
+              NSString *(^g)(NSString *) = ^NSString *(NSString *k) { id v = w[k]; return [v isKindOfClass:NSString.class] ? v : @""; };
+              // longest tokens first so {wp} is not read as {w}
+              NSArray *map = @[@[@"{wp}", g(@"windScale")], @[@"{bt}", g(@"feelsLike")], @[@"{pc}", g(@"precip")],
+                               @[@"{ps}", g(@"pressure")], @[@"{i}", weatherEmoji(g(@"icon"))], @[@"{n}", g(@"text")],
+                               @[@"{t}", g(@"temp")], @[@"{h}", g(@"humidity")], @[@"{w}", g(@"windDir")]];
+              NSString *out = fmt;
+              for (NSArray *m in map) out = [out stringByReplacingOccurrencesOfString:m[0] withString:m[1]];
+              return out;
+          }
+
+          #pragma mark - Widgets
+
+          static NSDateFormatter *formatterFor(NSString *fmt) {
+              NSString *loc = ps(@"dateLocale", @"");
+              NSString *key = [NSString stringWithFormat:@"%@|%@", loc, fmt];
+              NSDateFormatter *f = gFmt[key];
+              if (!f) {
+                  f = [NSDateFormatter new];
+                  f.locale = loc.length ? [NSLocale localeWithLocaleIdentifier:loc] : NSLocale.currentLocale;
+                  f.dateFormat = fmt;
+                  gFmt[key] = f;
+              }
+              return f;
+          }
+
+          static NSAttributedString *symbolStr(NSString *name, UIFont *font, UIColor *color) {
+              UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithFont:font];
+              UIImage *img = [UIImage systemImageNamed:name withConfiguration:cfg];
+              if (!img) return [[NSAttributedString alloc] initWithString:@""];
+              img = [img imageWithTintColor:color renderingMode:UIImageRenderingModeAlwaysOriginal];
+              NSTextAttachment *a = [NSTextAttachment new];
+              a.image = img;
+              return [NSAttributedString attributedStringWithAttachment:a];
+          }
+
+          static NSString *defaultType(int i, int j) {
+              if (j != 1) return @"none";
+              return i == 1 ? @"date" : (i == 2 ? @"time" : @"battery_cap");
+          }
+
+          static NSAttributedString *widgetStr(int i, int j, UIFont *font, UIColor *color, NSDictionary *attrs) {
+              NSString *type = ps(WK(i, j, @"type"), defaultType(i, j));
+              NSString *s = nil;
+              NSDate *now = [NSDate date];
+
+              if ([type isEqualToString:@"date"]) {
+                  s = [formatterFor(ps(WK(i, j, @"dateFormat"), @"E MMM dd")) stringFromDate:now];
+              } else if ([type isEqualToString:@"time"]) {
+                  s = [formatterFor(ps(WK(i, j, @"timeFormat"), @"HH:mm")) stringFromDate:now];
+              } else if ([type isEqualToString:@"text"]) {
+                  s = ps(WK(i, j, @"text"), @"Example");
+              } else if ([type isEqualToString:@"network"]) {
+                  int idx = [ps(WK(i, j, @"netType"), @"wifi") isEqualToString:@"cellular"] ? 1 : 0;
+                  int icon = (int)pd(WK(i, j, @"speedIcon"), 0);
+                  int minU = (int)pd(WK(i, j, @"minUnit"), 1);
+                  BOOL hideZero = pb(WK(i, j, @"hideZero"), NO);
+                  NSMutableArray *parts = [NSMutableArray array];
+                  NSArray *dn = @[@"↓", @"▼", @""], *up = @[@"↑", @"▲", @""];
+                  if (pb(WK(i, j, @"showDown"), YES) && !(hideZero && gDown[idx] < 1))
+                      [parts addObject:[NSString stringWithFormat:@"%@%@%@", dn[icon % 3], icon % 3 == 2 ? @"" : @" ", speedString(gDown[idx], minU)]];
+                  if (pb(WK(i, j, @"showUp"), NO) && !(hideZero && gUp[idx] < 1))
+                      [parts addObject:[NSString stringWithFormat:@"%@%@%@", up[icon % 3], icon % 3 == 2 ? @"" : @" ", speedString(gUp[idx], minU)]];
+                  s = [parts componentsJoinedByString:@"  "];
+              } else if ([type isEqualToString:@"temp"]) {
+                  double c = binfo(@"Temperature", 0) / 100.0;
+                  if (c <= 0) s = @"--";
+                  else if ([ps(WK(i, j, @"tempUnit"), @"c") isEqualToString:@"f"]) s = [NSString stringWithFormat:@"%.1f°F", c * 9.0 / 5.0 + 32.0];
+                  else s = [NSString stringWithFormat:@"%.1f°C", c];
+              } else if ([type isEqualToString:@"battery_details"]) {
+                  NSString *o = ps(WK(i, j, @"battOpt"), @"watts");
+                  if ([o isEqualToString:@"watts"]) {
+                      double w = fabs(binfo(@"Voltage", 0) * binfo(@"InstantAmperage", binfo(@"Amperage", 0))) / 1.0e6;
+                      s = [NSString stringWithFormat:@"%.1f W", w];
+                  } else if ([o isEqualToString:@"current"]) {
+                      double a = binfo(@"InstantAmperage", binfo(@"Amperage", 0));
+                      s = [NSString stringWithFormat:@"%d mA", (int)MAX(a, 0.0)];
+                  } else if ([o isEqualToString:@"amperage"]) {
+                      s = [NSString stringWithFormat:@"%d mA", (int)binfo(@"Amperage", 0)];
+                  } else if ([o isEqualToString:@"cycles"]) {
+                      s = [NSString stringWithFormat:@"%d", (int)binfo(@"CycleCount", 0)];
+                  } else {
+                      s = [NSString stringWithFormat:@"%d mAh", (int)binfo(@"AppleRawCurrentCapacity", binfo(@"CurrentCapacity", 0))];
+                  }
+              } else if ([type isEqualToString:@"battery_cap"]) {
+                  UIDevice *d = UIDevice.currentDevice;
+                  d.batteryMonitoringEnabled = YES;
+                  float l = d.batteryLevel;
+                  int pct = l < 0 ? 0 : (int)lroundf(l * 100);
+                  NSMutableAttributedString *m = [NSMutableAttributedString new];
+                  if (pb(WK(i, j, @"fillSymbol"), YES)) {
+                      NSString *sym = pct >= 88 ? @"battery.100" : (pct >= 63 ? @"battery.75" : (pct >= 38 ? @"battery.50" : (pct >= 13 ? @"battery.25" : @"battery.0")));
+                      [m appendAttributedString:symbolStr(sym, font, color)];
+                      [m appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:attrs]];
+                  }
+                  NSString *num = l < 0 ? @"--" : [NSString stringWithFormat:@"%d", pct];
+                  [m appendAttributedString:[[NSAttributedString alloc] initWithString:(pb(WK(i, j, @"showPercent"), YES) ? [num stringByAppendingString:@"%"] : num) attributes:attrs]];
+                  return m;
+              } else if ([type isEqualToString:@"charging"]) {
+                  return isCharging() ? symbolStr(@"bolt.fill", font, color) : [[NSAttributedString alloc] initWithString:@""];
+              } else if ([type isEqualToString:@"weather"]) {
+                  NSString *loc = ps(WK(i, j, @"weatherLoc"), @"");
+                  fetchWeather(loc);
+                  s = weatherText(ps(WK(i, j, @"weatherFmt"), @"{i}{n} {t}°"));
+              }
+              if (!s || s.length == 0) return nil;
+              return [[NSAttributedString alloc] initWithString:s attributes:attrs];
+          }
+
+          #pragma mark - Style helpers
+
+          static UIColor *parseHex(NSString *h) {
+              h = [[h stringByReplacingOccurrencesOfString:@"#" withString:@""] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+              if (h.length != 6) return nil;
+              unsigned v = 0;
+              if (![[NSScanner scannerWithString:h] scanHexInt:&v]) return nil;
+              return [UIColor colorWithRed:((v >> 16) & 255) / 255.0 green:((v >> 8) & 255) / 255.0 blue:(v & 255) / 255.0 alpha:1];
           }
 
           static UIColor *colorNamed(NSString *n) {
@@ -99,46 +319,117 @@ jobs:
               if ([n isEqualToString:@"green"])  return UIColor.systemGreenColor;
               if ([n isEqualToString:@"blue"])   return UIColor.systemBlueColor;
               if ([n isEqualToString:@"yellow"]) return UIColor.systemYellowColor;
+              if ([n isEqualToString:@"orange"]) return UIColor.systemOrangeColor;
+              if ([n isEqualToString:@"pink"])   return UIColor.systemPinkColor;
               return UIColor.whiteColor;
+          }
+
+          #pragma mark - Rendering
+
+          static void renderSet(int idx) {
+              int i = idx + 1;
+              UIView *cont = gCont[idx];
+              UILabel *lab = gLab[idx];
+              BOOL land = UIDeviceOrientationIsLandscape(UIDevice.currentDevice.orientation);
+              NSString *mode = ps(SK(i, @"orient"), @"both");
+              BOOL show = pb(SK(i, @"enabled"), YES)
+                  && !([mode isEqualToString:@"portrait"] && land) && !([mode isEqualToString:@"landscape"] && !land);
+              if (!show) { cont.hidden = YES; return; }
+
+              // text style
+              CGFloat size = (CGFloat)pd(SK(i, @"fontSize"), 13.0);
+              UIFont *font = nil;
+              NSString *fname = ps(SK(i, @"font"), @"");
+              if (fname.length) font = [UIFont fontWithName:fname size:size];
+              if (!font) font = [UIFont systemFontOfSize:size];
+              UIFontDescriptorSymbolicTraits tr = 0;
+              if (pb(SK(i, @"bold"), YES)) tr |= UIFontDescriptorTraitBold;
+              if (pb(SK(i, @"italic"), NO)) tr |= UIFontDescriptorTraitItalic;
+              if (tr) { UIFontDescriptor *dsc = [font.fontDescriptor fontDescriptorWithSymbolicTraits:tr]; if (dsc) font = [UIFont fontWithDescriptor:dsc size:size]; }
+
+              BOOL adaptive = pb(SK(i, @"adaptive"), pb(@"adaptiveColors", NO));
+              UIColor *color = nil;
+              if (adaptive) color = UIColor.labelColor;
+              else {
+                  color = parseHex(ps(SK(i, @"colorHex"), @""));
+                  if (!color) color = colorNamed(ps(SK(i, @"color"), @"white"));
+              }
+              color = [color colorWithAlphaComponent:(CGFloat)pd(SK(i, @"textAlpha"), 1.0)];
+
+              NSString *al = ps(SK(i, @"align"), i == 1 ? @"left" : (i == 3 ? @"right" : @"center"));
+              NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
+              para.alignment = [al isEqualToString:@"left"] ? NSTextAlignmentLeft : ([al isEqualToString:@"right"] ? NSTextAlignmentRight : NSTextAlignmentCenter);
+              NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: para};
+
+              // content
+              NSMutableAttributedString *all = [NSMutableAttributedString new];
+              NSString *sep = pb(SK(i, @"stack"), NO) ? @"\n" : @"  ";
+              for (int j = 1; j <= NSLOTS; j++) {
+                  NSAttributedString *w = widgetStr(i, j, font, color, attrs);
+                  if (!w || w.length == 0) continue;
+                  if (all.length) [all appendAttributedString:[[NSAttributedString alloc] initWithString:sep attributes:attrs]];
+                  [all appendAttributedString:w];
+              }
+              lab.attributedText = all;
+              lab.numberOfLines = 0;
+
+              // background blur
+              BOOL blur = pb(SK(i, @"blur"), NO);
+              gBlur[idx].hidden = !blur;
+              if (blur) {
+                  BOOL dark = [ps(SK(i, @"blurStyle"), @"dark") isEqualToString:@"dark"];
+                  gBlur[idx].effect = [UIBlurEffect effectWithStyle:dark ? UIBlurEffectStyleSystemThinMaterialDark : UIBlurEffectStyleSystemThinMaterialLight];
+                  gBlur[idx].layer.cornerRadius = (CGFloat)pd(SK(i, @"blurRadius"), 10.0);
+                  gBlur[idx].layer.masksToBounds = YES;
+                  gBlur[idx].alpha = (CGFloat)pd(SK(i, @"blurAlpha"), 1.0);
+              }
+              BOOL shadow = !blur && !adaptive;
+              lab.layer.shadowColor = UIColor.blackColor.CGColor;
+              lab.layer.shadowOpacity = shadow ? 0.55 : 0;
+              lab.layer.shadowRadius = 2;
+              lab.layer.shadowOffset = CGSizeZero;
+
+              // size
+              CGSize scr = UIScreen.mainScreen.bounds.size;
+              CGFloat pad = blur ? 8 : 2;
+              CGSize fit = [lab sizeThatFits:CGSizeMake(scr.width - 8 - 2 * pad, CGFLOAT_MAX)];
+              NSString *hA = ps(SK(i, @"anchorH"), i == 1 ? @"left" : (i == 3 ? @"right" : @"center"));
+              CGFloat w, h;
+              if (pb(SK(i, @"autoResize"), YES)) {
+                  w = MIN(ceil(fit.width) + 2 * pad, scr.width);
+                  h = ceil(fit.height) + (blur ? 6 : 2);
+              } else {
+                  double cw = pd(SK(i, @"width"), 0), ch = pd(SK(i, @"height"), 0);
+                  w = cw > 0 ? cw : [hA isEqualToString:@"center"] ? pd(@"centerWidgetSize", 200) : pd(@"sideWidgetSize", 130);
+                  h = ch > 0 ? ch : ceil(fit.height) + (blur ? 6 : 2);
+              }
+              if (all.length == 0) { cont.hidden = YES; return; }
+
+              // position
+              CGFloat ox = (CGFloat)pd(SK(i, land ? @"lOffX" : @"pOffX"), (i == 2) ? 0 : 24);
+              CGFloat oy = (CGFloat)pd(SK(i, land ? @"lOffY" : @"pOffY"), 50);
+              BOOL bottom = [ps(SK(i, @"anchorV"), @"top") isEqualToString:@"bottom"];
+              CGFloat x = [hA isEqualToString:@"left"] ? ox : ([hA isEqualToString:@"right"] ? scr.width - w - ox : (scr.width - w) / 2.0 + ox);
+              CGFloat y = bottom ? scr.height - h - oy : oy;
+              cont.frame = CGRectMake(x, y, w, h);
+              gBlur[idx].frame = cont.bounds;
+              lab.frame = CGRectMake(pad, 0, w - 2 * pad, h);
+              cont.layer.borderWidth = pb(@"debugBorder", NO) ? 1 : 0;
+              cont.layer.borderColor = UIColor.redColor.CGColor;
+              cont.hidden = NO;
+              gLast[idx] = CACurrentMediaTime();
+          }
+
+          static void renderAll(void) {
+              for (int k = 0; k < NSETS; k++) renderSet(k);
           }
 
           static void applyPrefs(void) {
               if (!gWin) return;
-              CFPreferencesAppSynchronize(kDomain);
-              gWin.hidden = !prefBool(@"enabled", YES);
-
-              NSLocale *loc = NSLocale.currentLocale;
-              gTimeF    = [NSDateFormatter new]; gTimeF.dateFormat    = [NSDateFormatter dateFormatFromTemplate:@"jm"  options:0 locale:loc];
-              gTimeSecF = [NSDateFormatter new]; gTimeSecF.dateFormat = [NSDateFormatter dateFormatFromTemplate:@"jms" options:0 locale:loc];
-              gDateF    = [NSDateFormatter new]; gDateF.dateFormat    = [NSDateFormatter dateFormatFromTemplate:@"EEEdMMM" options:0 locale:loc];
-
-              gTypes[0] = prefString(@"leftType",   @"date");
-              gTypes[1] = prefString(@"centerType", @"time");
-              gTypes[2] = prefString(@"rightType",  @"battery");
-              gCustom[0] = prefString(@"leftText",   @"");
-              gCustom[1] = prefString(@"centerText", @"");
-              gCustom[2] = prefString(@"rightText",  @"");
-
-              CGFloat size = (CGFloat)prefDouble(@"fontSize", 13.0);
-              UIFont *font = prefBool(@"bold", YES) ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
-              UIColor *color = colorNamed(prefString(@"color", @"white"));
-              CGFloat alpha = (CGFloat)prefDouble(@"opacity", 1.0);
-              CGFloat y = (CGFloat)prefDouble(@"yOffset", 50.0);
-              CGFloat inset = (CGFloat)prefDouble(@"sideInset", 24.0);
-              CGFloat W = UIScreen.mainScreen.bounds.size.width, third = (W - 2 * inset) / 3.0;
-              NSTextAlignment al[3] = { NSTextAlignmentLeft, NSTextAlignmentCenter, NSTextAlignmentRight };
-              for (int i = 0; i < 3; i++) {
-                  gLabels[i].font = font;
-                  gLabels[i].textColor = color;
-                  gLabels[i].alpha = alpha;
-                  gLabels[i].textAlignment = al[i];
-                  gLabels[i].frame = CGRectMake(inset + i * third, y, third, size + 10);
-                  gLabels[i].layer.shadowColor = UIColor.blackColor.CGColor;
-                  gLabels[i].layer.shadowOpacity = [color isEqual:UIColor.blackColor] ? 0 : 0.6;
-                  gLabels[i].layer.shadowRadius = 2;
-                  gLabels[i].layer.shadowOffset = CGSizeZero;
-              }
-              tick();
+              loadPrefs();
+              gFmt = [NSMutableDictionary dictionary];
+              gWin.hidden = !pb(@"enabled", YES);
+              renderAll();
           }
 
           static void onReload(CFNotificationCenterRef c, void *o, CFNotificationName n, const void *obj, CFDictionaryRef u) {
@@ -152,8 +443,7 @@ jobs:
               for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
                   if ([s isKindOfClass:UIWindowScene.class]) { scene = (UIWindowScene *)s; break; }
               }
-              gWin = scene ? [[MHWindow alloc] initWithWindowScene:scene]
-                           : [[MHWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+              gWin = scene ? [[MHWindow alloc] initWithWindowScene:scene] : [[MHWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
               gWin.frame = UIScreen.mainScreen.bounds;
               gWin.windowLevel = 100000;
               gWin.backgroundColor = UIColor.clearColor;
@@ -162,13 +452,19 @@ jobs:
               vc.view.backgroundColor = UIColor.clearColor;
               vc.view.userInteractionEnabled = NO;
               gWin.rootViewController = vc;
-              for (int i = 0; i < 3; i++) {
-                  gLabels[i] = [UILabel new];
-                  gLabels[i].userInteractionEnabled = NO;
-                  gLabels[i].adjustsFontSizeToFitWidth = YES;
-                  gLabels[i].minimumScaleFactor = 0.6;
-                  [vc.view addSubview:gLabels[i]];
+              for (int k = 0; k < NSETS; k++) {
+                  gCont[k] = [UIView new];
+                  gCont[k].userInteractionEnabled = NO;
+                  gBlur[k] = [[UIVisualEffectView alloc] initWithEffect:nil];
+                  gBlur[k].userInteractionEnabled = NO;
+                  gLab[k] = [UILabel new];
+                  gLab[k].userInteractionEnabled = NO;
+                  [gCont[k] addSubview:gBlur[k]];
+                  [gCont[k] addSubview:gLab[k]];
+                  [vc.view addSubview:gCont[k]];
               }
+              UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+              [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
               gWin.hidden = NO;
               applyPrefs();
 
@@ -176,10 +472,18 @@ jobs:
                   CFSTR("local.mayhud.reload"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
               gTimer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-                  if (++gTick % 10 == 0) applyPrefs(); else tick();
+                  gTick++;
+                  if (gTick % 15 == 0) { applyPrefs(); return; }
+                  if (gWin.hidden) return;
+                  sampleNet();
+                  NSTimeInterval now = CACurrentMediaTime();
+                  for (int k = 0; k < NSETS; k++) {
+                      double iv = MAX(1.0, pd(SK(k + 1, @"interval"), 1.0));
+                      if (now - gLast[k] >= iv - 0.05) renderSet(k);
+                  }
               }];
               [NSRunLoop.mainRunLoop addTimer:gTimer forMode:NSRunLoopCommonModes];
-              NSLog(@"[MayHUD] window created (scene: %@)", scene ? @"yes" : @"no");
+              NSLog(@"[MayHUD] ready (scene: %@)", scene ? @"yes" : @"no");
           }
 
           __attribute__((constructor))
@@ -189,30 +493,19 @@ jobs:
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ setup(); });
           }
           MAYEOF
-          cat > MayHUD.plist <<'MAYEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict><key>Filter</key><dict><key>Bundles</key><array><string>com.apple.springboard</string></array></dict></dict></plist>
-          MAYEOF
-          cat > control <<'MAYEOF'
-          Package: local.mayhud
-          Name: MayHUD
-          Version: 0.1.0
-          Architecture: iphoneos-arm64e
-          Description: Status-bar widgets (time, date, battery, custom text) drawn inside SpringBoard. Settings pane in the Settings app.
-          Maintainer: Local Build
-          Author: Local Build
-          Section: Tweaks
-          Depends: ellekit | mobilesubstrate
-          MAYEOF
           cat > PrefsController.m <<'MAYEOF'
-          // MayHUD settings pane with an English / Russian switch (English by default).
+          // MayHUD settings: one controller that shows any pane (Root, Set1.., Set1W1..) in English or Russian.
           #import <UIKit/UIKit.h>
 
           @interface PSSpecifier : NSObject
+          - (id)propertyForKey:(NSString *)key;
           @end
 
-          @interface PSListController : UIViewController
+          @interface PSViewController : UIViewController
+          @property (nonatomic, retain) PSSpecifier *specifier;
+          @end
+
+          @interface PSListController : PSViewController
           - (NSArray *)loadSpecifiersFromPlistName:(NSString *)name target:(id)target;
           - (void)reloadSpecifiers;
           - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier;
@@ -231,19 +524,24 @@ jobs:
               return r;
           }
 
-          @interface MHRootListController : PSListController
+          @interface MHPaneController : PSListController
           @property (nonatomic, copy) NSString *loadedLang;
           @end
 
-          @implementation MHRootListController
+          @implementation MHPaneController
+
+          - (NSString *)paneName {
+              NSString *n = nil;
+              @try { n = [self.specifier propertyForKey:@"mhplist"]; } @catch (__unused id e) {}
+              return ([n isKindOfClass:NSString.class] && n.length) ? n : @"Root";
+          }
 
           - (NSArray *)specifiers {
               NSArray *s = nil;
               @try { s = [self valueForKey:@"_specifiers"]; } @catch (__unused id e) {}
               if (!s) {
                   NSString *lang = currentLang();
-                  NSString *plist = [lang isEqualToString:@"ru"] ? @"RootRU" : @"RootEN";
-                  s = [self loadSpecifiersFromPlistName:plist target:self];
+                  s = [self loadSpecifiersFromPlistName:[NSString stringWithFormat:@"%@_%@", [self paneName], lang] target:self];
                   @try { [self setValue:s forKey:@"_specifiers"]; } @catch (__unused id e) {}
                   self.loadedLang = lang;
               }
@@ -267,1174 +565,195 @@ jobs:
               [self refreshIfLangChanged];
           }
 
+          - (void)resetData {
+              CFArrayRef keys = CFPreferencesCopyKeyList(kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+              if (keys) {
+                  NSMutableArray *del = [NSMutableArray array];
+                  for (NSString *k in (__bridge NSArray *)keys) if (![k isEqualToString:@"language"]) [del addObject:k];
+                  CFPreferencesSetMultiple(NULL, (__bridge CFArrayRef)del, kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+                  CFRelease(keys);
+              }
+              CFPreferencesAppSynchronize(kDomain);
+              CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("local.mayhud.reload"), NULL, NULL, true);
+              @try { [self setValue:nil forKey:@"_specifiers"]; } @catch (__unused id e) {}
+              [self reloadSpecifiers];
+          }
+
           @end
           MAYEOF
-          cat > RootEN.plist <<'MAYEOF'
+          cat > gen_prefs.py <<'MAYEOF'
+          # Generates the MayHUD settings panes (English + Russian) into ./bundle
+          import plistlib, os
+          D = 'local.mayhud'; N = 'local.mayhud.reload'
+          RU = {
+           'Language':'Язык','Default language is English.':'По умолчанию английский.','Enable MayHUD':'Включить MayHUD',
+           'Widget Sets':'Наборы виджетов','Widget Set 1':'Набор виджетов 1','Widget Set 2':'Набор виджетов 2','Widget Set 3':'Набор виджетов 3',
+           'Preferences':'Настройки','Date Locale':'Локаль даты','QWeather API key':'API-ключ QWeather','Display Debug Border':'Показывать рамку отладки',
+           'Use Adaptive Colors':'Адаптивные цвета','Side Widget Size':'Ширина боковых виджетов','Center Widget Size':'Ширина центрального виджета',
+           'Helium Data':'Данные','Reset Data':'Сбросить данные','Credits':'Авторы',
+           'Design and features follow Helium by LeminLimez. MayHUD is an independent re-implementation that runs inside SpringBoard.':'Дизайн и функции по мотивам Helium от LeminLimez. MayHUD — независимая реализация, работающая внутри SpringBoard.',
+           'Enable Widget Set':'Включить набор','Orientation Mode':'Режим ориентации','Portrait & Landscape':'Портрет и альбом','Portrait':'Портрет','Landscape':'Альбом',
+           'Update Interval (seconds)':'Интервал обновления (сек)','Widget Set Details':'Параметры набора','Horizontal Anchor Side':'Горизонтальная привязка',
+           'Vertical Anchor Side':'Вертикальная привязка','Left':'Слева','Center':'По центру','Right':'Справа','Top':'Сверху','Bottom':'Снизу',
+           'Portrait Offset X':'Отступ X (портрет)','Portrait Offset Y':'Отступ Y (портрет)','Landscape Offset X':'Отступ X (альбом)','Landscape Offset Y':'Отступ Y (альбом)',
+           'Positioning':'Положение','Stack widgets vertically':'Виджеты в столбик','Auto Resize':'Авто-размер','Width':'Ширина','Height':'Высота','Size Constraints':'Размер',
+           'Background Blur':'Размытие фона','Blur Style':'Стиль размытия','Light':'Светлый','Dark':'Тёмный','Blur Corner Radius':'Радиус скругления','Blur Alpha':'Прозрачность размытия',
+           'Text Properties':'Свойства текста','Text Color':'Цвет текста','Custom Hex Color (RRGGBB)':'Свой цвет (RRGGBB)','Adaptive Color':'Адаптивный цвет','Text Font':'Шрифт (имя)',
+           'Bold Text':'Жирный','Italic Text':'Курсив','Text Alignment':'Выравнивание текста','Font Size':'Размер шрифта','Text Alpha':'Прозрачность текста',
+           'Widgets':'Виджеты','Widget 1':'Виджет 1','Widget 2':'Виджет 2','Widget 3':'Виджет 3','Widget 4':'Виджет 4','Widget Type':'Тип виджета',
+           'None':'Нет','Date':'Дата','Time':'Время','Text Label':'Текст','Network':'Сеть','Device Temperature':'Температура','Battery Details':'Детали батареи',
+           'Battery Capacity':'Заряд батареи','Charging Symbol':'Значок зарядки','Weather':'Погода',
+           'Date Format':'Формат даты','Time Format':'Формат времени','Label Text':'Текст','Network Type':'Тип сети','Download':'Загрузка','Upload':'Отдача',
+           'Speed Icon':'Значок скорости','Minimum Unit':'Минимальная единица','Hide Speed When 0':'Скрывать при нуле','Temperature Unit':'Единица температуры',
+           'Celsius':'Цельсий','Fahrenheit':'Фаренгейт','Battery Option':'Что показывать','Watts':'Ватты','Charging Current':'Ток зарядки','Amperage':'Сила тока',
+           'Charge Cycles':'Циклы зарядки','Current Capacity':'Текущая ёмкость','Show Percent (%) Symbol':'Показывать знак %','Fill Symbol':'Значок батареи',
+           'LocationID or Latitude,Longitude':'ID города или координаты','Weather Format':'Формат погоды','Arrows (↓ ↑)':'Стрелки (↓ ↑)','Triangles (▼ ▲)':'Треугольники (▼ ▲)','No icon':'Без значка',
+           'White':'Белый','Black':'Чёрный','Red':'Красный','Green':'Зелёный','Blue':'Синий','Yellow':'Жёлтый','Orange':'Оранжевый','Pink':'Розовый',
+           'Wi-Fi':'Wi-Fi','Cellular':'Сотовая','Adjust values, then reopen if sliders look stale.':'Подвигай значения; если ползунки не обновились, открой экран заново.',
+           'Tokens: {i} icon {n} text {t} temp {h} humidity {w} wind dir {wp} wind power {bt} feels like {pc} precip {ps} pressure':'Подстановки: {i} значок {n} текст {t} темп. {h} влажность {w} направление ветра {wp} сила ветра {bt} ощущается {pc} осадки {ps} давление',
+           'Date: e.g. E MMM dd. Time: e.g. HH:mm:ss':'Дата: например E MMM dd. Время: например HH:mm:ss',
+           'Default sits just below the status bar. Lower Offset Y to move it onto the status bar.':'По умолчанию набор чуть ниже статус-бара. Уменьши отступ Y, чтобы поднять его на статус-бар.',
+           'Color presets or a hex value (hex wins).':'Готовые цвета или hex-значение (hex главнее).',
+           'Font name e.g. Menlo-Bold (empty = system)':'Имя шрифта, напр. Menlo-Bold (пусто = системный)',
+           'Resets every MayHUD setting except language.':'Сбрасывает все настройки MayHUD, кроме языка.',
+          }
+          LANG = 'en'
+          def T(s): return RU.get(s, s) if LANG == 'ru' else s
+          def pn(d): d['PostNotification'] = N; return d
+          def grp(label=None, foot=None):
+              d = {'cell': 'PSGroupCell'}
+              if label: d['label'] = T(label)
+              if foot: d['footerText'] = T(foot)
+              return d
+          def sw(key, label, default): return pn({'cell':'PSSwitchCell','label':T(label),'default':default,'defaults':D,'key':key})
+          def lst(key, label, default, opts):
+              return pn({'cell':'PSLinkListCell','label':T(label),'default':default,'defaults':D,'key':key,'detail':'PSListItemsController',
+                         'validTitles':[T(a) for a, b in opts],'validValues':[b for a, b in opts]})
+          def edt(key, label, default='', ph=''):
+              return pn({'cell':'PSEditTextCell','label':T(label),'default':default,'defaults':D,'key':key,'placeholder':ph})
+          def sld(key, default, mn, mx): return pn({'cell':'PSSliderCell','default':float(default),'defaults':D,'key':key,'min':float(mn),'max':float(mx),'showValue':True})
+          def lnk(label, plist): return {'cell':'PSLinkCell','label':T(label),'detail':'MHPaneController','mhplist':plist}
+
+          TYPES = [('None','none'),('Date','date'),('Time','time'),('Text Label','text'),('Network','network'),('Device Temperature','temp'),
+                   ('Battery Details','battery_details'),('Battery Capacity','battery_cap'),('Charging Symbol','charging'),('Weather','weather')]
+          DEF_TYPE = {1:'date', 2:'time', 3:'battery_cap'}
+          SIDE = {1:'left', 2:'center', 3:'right'}
+          COLORS = [('White','white'),('Black','black'),('Red','red'),('Green','green'),('Blue','blue'),('Yellow','yellow'),('Orange','orange'),('Pink','pink')]
+
+          def root():
+              it = [grp('Language','Default language is English.'),
+                    {'cell':'PSLinkListCell','label':T('Language'),'default':'en','defaults':D,'key':'language','detail':'PSListItemsController','validTitles':['English','Русский'],'validValues':['en','ru']},
+                    grp('MayHUD'), sw('enabled','Enable MayHUD',True),
+                    grp('Widget Sets')] + [lnk('Widget Set %d'%i, 'Set%d'%i) for i in (1,2,3)] + [
+                    grp('Preferences'),
+                    edt('dateLocale','Date Locale','','en_US'),
+                    edt('weatherApiKey','QWeather API key','','key'),
+                    sw('debugBorder','Display Debug Border',False),
+                    sw('adaptiveColors','Use Adaptive Colors',False),
+                    grp('Side Widget Size'), sld('sideWidgetSize',130,50,400),
+                    grp('Center Widget Size'), sld('centerWidgetSize',200,50,500),
+                    grp('Helium Data','Resets every MayHUD setting except language.'),
+                    {'cell':'PSButtonCell','label':T('Reset Data'),'action':'resetData','cellClass':'PSButtonCell'},
+                    grp('Credits','Design and features follow Helium by LeminLimez. MayHUD is an independent re-implementation that runs inside SpringBoard.')]
+              return {'title':'MayHUD','items':it}
+
+          def setpane(i):
+              k = lambda n: 's%d_%s' % (i, n)
+              it = [grp('Widget Set %d'%i), sw(k('enabled'),'Enable Widget Set',True),
+                    lst(k('orient'),'Orientation Mode','both',[('Portrait & Landscape','both'),('Portrait','portrait'),('Landscape','landscape')]),
+                    grp('Update Interval (seconds)'), sld(k('interval'),1,1,60),
+                    grp('Widget Set Details'),
+                    lst(k('anchorH'),'Horizontal Anchor Side',SIDE[i],[('Left','left'),('Center','center'),('Right','right')]),
+                    lst(k('anchorV'),'Vertical Anchor Side','top',[('Top','top'),('Bottom','bottom')]),
+                    grp('Portrait Offset X'), sld(k('pOffX'),0 if i==2 else 24,-300,400),
+                    grp('Portrait Offset Y','Default sits just below the status bar. Lower Offset Y to move it onto the status bar.'), sld(k('pOffY'),50,-100,800),
+                    grp('Landscape Offset X'), sld(k('lOffX'),0 if i==2 else 24,-300,800),
+                    grp('Landscape Offset Y'), sld(k('lOffY'),20,-100,400),
+                    grp('Positioning'), sw(k('stack'),'Stack widgets vertically',False),
+                    grp('Size Constraints'), sw(k('autoResize'),'Auto Resize',True),
+                    grp('Width'), sld(k('width'),0,0,500), grp('Height'), sld(k('height'),0,0,300),
+                    grp('Background Blur'), sw(k('blur'),'Background Blur',False),
+                    lst(k('blurStyle'),'Blur Style','dark',[('Dark','dark'),('Light','light')]),
+                    grp('Blur Corner Radius'), sld(k('blurRadius'),10,0,40),
+                    grp('Blur Alpha'), sld(k('blurAlpha'),1,0,1),
+                    grp('Text Properties','Color presets or a hex value (hex wins).'),
+                    lst(k('color'),'Text Color','white',COLORS),
+                    edt(k('colorHex'),'Custom Hex Color (RRGGBB)','','FFFFFF'),
+                    sw(k('adaptive'),'Adaptive Color',False),
+                    edt(k('font'),'Text Font','','Menlo-Bold'),
+                    sw(k('bold'),'Bold Text',True), sw(k('italic'),'Italic Text',False),
+                    lst(k('align'),'Text Alignment',SIDE[i],[('Left','left'),('Center','center'),('Right','right')]),
+                    grp('Font Size'), sld(k('fontSize'),13,6,40),
+                    grp('Text Alpha'), sld(k('textAlpha'),1,0.1,1),
+                    grp('Widgets')] + [lnk('Widget %d'%j, 'Set%dW%d'%(i,j)) for j in (1,2,3,4)]
+              return {'title':T('Widget Set %d'%i),'items':it}
+
+          def widgetpane(i,j):
+              k = lambda n: 's%dw%d_%s' % (i,j,n)
+              it = [grp('Widget %d'%j,'Date: e.g. E MMM dd. Time: e.g. HH:mm:ss'),
+                    lst(k('type'),'Widget Type',DEF_TYPE[i] if j==1 else 'none',TYPES),
+                    grp('Date'), edt(k('dateFormat'),'Date Format','E MMM dd','E MMM dd'),
+                    grp('Time'), edt(k('timeFormat'),'Time Format','HH:mm','HH:mm'),
+                    grp('Text Label'), edt(k('text'),'Label Text','Example','Example'),
+                    grp('Network'),
+                    lst(k('netType'),'Network Type','wifi',[('Wi-Fi','wifi'),('Cellular','cellular')]),
+                    sw(k('showDown'),'Download',True), sw(k('showUp'),'Upload',False),
+                    lst(k('speedIcon'),'Speed Icon',0,[('Arrows (↓ ↑)',0),('Triangles (▼ ▲)',1),('No icon',2)]),
+                    lst(k('minUnit'),'Minimum Unit',1,[('B/s',0),('KB/s',1),('MB/s',2)]),
+                    sw(k('hideZero'),'Hide Speed When 0',False),
+                    grp('Device Temperature'), lst(k('tempUnit'),'Temperature Unit','c',[('Celsius','c'),('Fahrenheit','f')]),
+                    grp('Battery Details'),
+                    lst(k('battOpt'),'Battery Option','watts',[('Watts','watts'),('Charging Current','current'),('Amperage','amperage'),('Charge Cycles','cycles'),('Current Capacity','capacity')]),
+                    grp('Battery Capacity'), sw(k('showPercent'),'Show Percent (%) Symbol',True), sw(k('fillSymbol'),'Fill Symbol',True),
+                    grp('Weather','Tokens: {i} icon {n} text {t} temp {h} humidity {w} wind dir {wp} wind power {bt} feels like {pc} precip {ps} pressure'),
+                    edt(k('weatherLoc'),'LocationID or Latitude,Longitude','','101010100'),
+                    edt(k('weatherFmt'),'Weather Format','{i}{n} {t}°','{i}{n} {t}°')]
+              return {'title':T('Widget %d'%j),'items':it}
+
+          def fallback():
+              it = [grp('MayHUD'), sw('enabled','Enable MayHUD',True)]
+              for i in (1,2,3):
+                  it += [grp('Widget Set %d'%i), sw('s%d_enabled'%i,'Enable Widget Set',True),
+                         lst('s%dw1_type'%i,'Widget Type',DEF_TYPE[i],TYPES), lst('s%dw2_type'%i,'Widget Type','none',TYPES),
+                         sld('s%d_pOffY'%i,50,-100,800), sld('s%d_fontSize'%i,13,6,40)]
+              return {'title':'MayHUD','items':it,'entry':{'cell':'PSLinkCell','label':'MayHUD','icon':'icon.png'}}
+
+          os.makedirs('bundle', exist_ok=True)
+          w = lambda n, d: open(os.path.join('bundle', n), 'wb').write(plistlib.dumps(d, fmt=plistlib.FMT_XML))
+          for LANG in ('en', 'ru'):
+              w('Root_%s.plist' % LANG, root())
+              for i in (1,2,3):
+                  w('Set%d_%s.plist' % (i, LANG), setpane(i))
+                  for j in (1,2,3,4): w('Set%dW%d_%s.plist' % (i,j,LANG), widgetpane(i,j))
+          LANG = 'en'
+          w('PrefsFallback.plist', fallback())
+          w('Info.plist', {'CFBundleDevelopmentRegion':'en','CFBundleExecutable':'MayHUDPrefs','CFBundleIdentifier':'local.mayhudprefs','CFBundleInfoDictionaryVersion':'6.0',
+                           'CFBundleName':'MayHUDPrefs','CFBundlePackageType':'BNDL','CFBundleShortVersionString':'0.2.0','CFBundleVersion':'1','NSPrincipalClass':'MHPaneController'})
+          w('PrefsEntry.plist', {'entry':{'bundle':'MayHUDPrefs','cell':'PSLinkCell','detail':'MHPaneController','isController':True,'label':'MayHUD','icon':'icon.png'}})
+          print('generated', len(os.listdir('bundle')), 'files')
+          MAYEOF
+          cat > MayHUD.plist <<'MAYEOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-          	<key>items</key>
-          	<array>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>footerText</key>
-          			<string>Default language is English.</string>
-          			<key>label</key>
-          			<string>Language</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>en</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>language</string>
-          			<key>label</key>
-          			<string>Language</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>English</string>
-          				<string>Русский</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>en</string>
-          				<string>ru</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>footerText</key>
-          			<string>Widgets are drawn over the status bar. In custom text you can use {time}, {date}, {battery}.</string>
-          			<key>label</key>
-          			<string>MayHUD</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSwitchCell</string>
-          			<key>default</key>
-          			<true/>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>enabled</string>
-          			<key>label</key>
-          			<string>Enable MayHUD</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Left widget</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>date</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>leftType</string>
-          			<key>label</key>
-          			<string>Type</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>None</string>
-          				<string>Time</string>
-          				<string>Time with seconds</string>
-          				<string>Date</string>
-          				<string>Battery</string>
-          				<string>Custom text</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>leftText</string>
-          			<key>label</key>
-          			<string>Custom text</string>
-          			<key>placeholder</key>
-          			<string>Text, e.g. Battery {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Center widget</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>time</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>centerType</string>
-          			<key>label</key>
-          			<string>Type</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>None</string>
-          				<string>Time</string>
-          				<string>Time with seconds</string>
-          				<string>Date</string>
-          				<string>Battery</string>
-          				<string>Custom text</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>centerText</string>
-          			<key>label</key>
-          			<string>Custom text</string>
-          			<key>placeholder</key>
-          			<string>Text, e.g. Battery {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Right widget</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>battery</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>rightType</string>
-          			<key>label</key>
-          			<string>Type</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>None</string>
-          				<string>Time</string>
-          				<string>Time with seconds</string>
-          				<string>Date</string>
-          				<string>Battery</string>
-          				<string>Custom text</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>rightText</string>
-          			<key>label</key>
-          			<string>Custom text</string>
-          			<key>placeholder</key>
-          			<string>Text, e.g. Battery {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Look</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSwitchCell</string>
-          			<key>default</key>
-          			<true/>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>bold</string>
-          			<key>label</key>
-          			<string>Bold text</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>white</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>color</string>
-          			<key>label</key>
-          			<string>Text color</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>White</string>
-          				<string>Black</string>
-          				<string>Red</string>
-          				<string>Green</string>
-          				<string>Blue</string>
-          				<string>Yellow</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>white</string>
-          				<string>black</string>
-          				<string>red</string>
-          				<string>green</string>
-          				<string>blue</string>
-          				<string>yellow</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Font size</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>13.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>fontSize</string>
-          			<key>max</key>
-          			<real>30.0</real>
-          			<key>min</key>
-          			<real>8.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>footerText</key>
-          			<string>Default sits just below the status bar. Lower the value to move it up onto the status bar.</string>
-          			<key>label</key>
-          			<string>Vertical position</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>50.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>yOffset</string>
-          			<key>max</key>
-          			<real>160.0</real>
-          			<key>min</key>
-          			<real>0.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Side margin</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>24.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>sideInset</string>
-          			<key>max</key>
-          			<real>120.0</real>
-          			<key>min</key>
-          			<real>0.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Opacity</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>1.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>opacity</string>
-          			<key>max</key>
-          			<real>1.0</real>
-          			<key>min</key>
-          			<real>0.1</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          	</array>
-          	<key>title</key>
-          	<string>MayHUD</string>
-          </dict>
-          </plist>
+          <plist version="1.0"><dict><key>Filter</key><dict><key>Bundles</key><array><string>com.apple.springboard</string></array></dict></dict></plist>
           MAYEOF
-          cat > RootRU.plist <<'MAYEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-          	<key>items</key>
-          	<array>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>footerText</key>
-          			<string>По умолчанию английский.</string>
-          			<key>label</key>
-          			<string>Язык</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>en</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>language</string>
-          			<key>label</key>
-          			<string>Язык</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>English</string>
-          				<string>Русский</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>en</string>
-          				<string>ru</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>footerText</key>
-          			<string>Виджеты рисуются поверх статус-бара. В своём тексте можно писать {time}, {date}, {battery}.</string>
-          			<key>label</key>
-          			<string>MayHUD</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSwitchCell</string>
-          			<key>default</key>
-          			<true/>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>enabled</string>
-          			<key>label</key>
-          			<string>Включить MayHUD</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Левый виджет</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>date</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>leftType</string>
-          			<key>label</key>
-          			<string>Тип</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>Нет</string>
-          				<string>Время</string>
-          				<string>Время с секундами</string>
-          				<string>Дата</string>
-          				<string>Заряд</string>
-          				<string>Свой текст</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>leftText</string>
-          			<key>label</key>
-          			<string>Свой текст</string>
-          			<key>placeholder</key>
-          			<string>Текст, например Заряд {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Центральный виджет</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>time</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>centerType</string>
-          			<key>label</key>
-          			<string>Тип</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>Нет</string>
-          				<string>Время</string>
-          				<string>Время с секундами</string>
-          				<string>Дата</string>
-          				<string>Заряд</string>
-          				<string>Свой текст</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>centerText</string>
-          			<key>label</key>
-          			<string>Свой текст</string>
-          			<key>placeholder</key>
-          			<string>Текст, например Заряд {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Правый виджет</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>battery</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>rightType</string>
-          			<key>label</key>
-          			<string>Тип</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>Нет</string>
-          				<string>Время</string>
-          				<string>Время с секундами</string>
-          				<string>Дата</string>
-          				<string>Заряд</string>
-          				<string>Свой текст</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>rightText</string>
-          			<key>label</key>
-          			<string>Свой текст</string>
-          			<key>placeholder</key>
-          			<string>Текст, например Заряд {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Внешний вид</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSwitchCell</string>
-          			<key>default</key>
-          			<true/>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>bold</string>
-          			<key>label</key>
-          			<string>Жирный шрифт</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>white</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>color</string>
-          			<key>label</key>
-          			<string>Цвет текста</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>Белый</string>
-          				<string>Чёрный</string>
-          				<string>Красный</string>
-          				<string>Зелёный</string>
-          				<string>Синий</string>
-          				<string>Жёлтый</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>white</string>
-          				<string>black</string>
-          				<string>red</string>
-          				<string>green</string>
-          				<string>blue</string>
-          				<string>yellow</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Размер шрифта</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>13.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>fontSize</string>
-          			<key>max</key>
-          			<real>30.0</real>
-          			<key>min</key>
-          			<real>8.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>footerText</key>
-          			<string>По умолчанию виджеты чуть ниже статус-бара. Уменьши значение, чтобы поднять их на статус-бар.</string>
-          			<key>label</key>
-          			<string>Положение по вертикали</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>50.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>yOffset</string>
-          			<key>max</key>
-          			<real>160.0</real>
-          			<key>min</key>
-          			<real>0.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Отступ от краёв</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>24.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>sideInset</string>
-          			<key>max</key>
-          			<real>120.0</real>
-          			<key>min</key>
-          			<real>0.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Прозрачность</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>1.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>opacity</string>
-          			<key>max</key>
-          			<real>1.0</real>
-          			<key>min</key>
-          			<real>0.1</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          	</array>
-          	<key>title</key>
-          	<string>MayHUD</string>
-          </dict>
-          </plist>
+          cat > control <<'MAYEOF'
+          Package: local.mayhud
+          Name: MayHUD
+          Version: 0.2.0
+          Architecture: iphoneos-arm64e
+          Description: Helium-style widget sets (date, time, text, network speed, temperature, battery, weather) drawn inside SpringBoard, with a full settings pane in the Settings app.
+          Maintainer: Local Build
+          Author: Local Build
+          Section: Tweaks
+          Depends: ellekit | mobilesubstrate
           MAYEOF
-          cat > PrefsFallback.plist <<'MAYEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-          	<key>entry</key>
-          	<dict>
-          		<key>cell</key>
-          		<string>PSLinkCell</string>
-          		<key>label</key>
-          		<string>MayHUD</string>
-          	</dict>
-          	<key>items</key>
-          	<array>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>footerText</key>
-          			<string>Widgets are drawn over the status bar. In custom text you can use {time}, {date}, {battery}.</string>
-          			<key>label</key>
-          			<string>MayHUD</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSwitchCell</string>
-          			<key>default</key>
-          			<true/>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>enabled</string>
-          			<key>label</key>
-          			<string>Enable MayHUD</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Left widget</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>date</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>leftType</string>
-          			<key>label</key>
-          			<string>Type</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>None</string>
-          				<string>Time</string>
-          				<string>Time with seconds</string>
-          				<string>Date</string>
-          				<string>Battery</string>
-          				<string>Custom text</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>leftText</string>
-          			<key>label</key>
-          			<string>Custom text</string>
-          			<key>placeholder</key>
-          			<string>Text, e.g. Battery {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Center widget</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>time</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>centerType</string>
-          			<key>label</key>
-          			<string>Type</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>None</string>
-          				<string>Time</string>
-          				<string>Time with seconds</string>
-          				<string>Date</string>
-          				<string>Battery</string>
-          				<string>Custom text</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>centerText</string>
-          			<key>label</key>
-          			<string>Custom text</string>
-          			<key>placeholder</key>
-          			<string>Text, e.g. Battery {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Right widget</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>battery</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>rightType</string>
-          			<key>label</key>
-          			<string>Type</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>None</string>
-          				<string>Time</string>
-          				<string>Time with seconds</string>
-          				<string>Date</string>
-          				<string>Battery</string>
-          				<string>Custom text</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>none</string>
-          				<string>time</string>
-          				<string>timesec</string>
-          				<string>date</string>
-          				<string>battery</string>
-          				<string>custom</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSEditTextCell</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>rightText</string>
-          			<key>label</key>
-          			<string>Custom text</string>
-          			<key>placeholder</key>
-          			<string>Text, e.g. Battery {battery}</string>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Look</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSwitchCell</string>
-          			<key>default</key>
-          			<true/>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>bold</string>
-          			<key>label</key>
-          			<string>Bold text</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSLinkListCell</string>
-          			<key>default</key>
-          			<string>white</string>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>detail</key>
-          			<string>PSListItemsController</string>
-          			<key>key</key>
-          			<string>color</string>
-          			<key>label</key>
-          			<string>Text color</string>
-          			<key>validTitles</key>
-          			<array>
-          				<string>White</string>
-          				<string>Black</string>
-          				<string>Red</string>
-          				<string>Green</string>
-          				<string>Blue</string>
-          				<string>Yellow</string>
-          			</array>
-          			<key>validValues</key>
-          			<array>
-          				<string>white</string>
-          				<string>black</string>
-          				<string>red</string>
-          				<string>green</string>
-          				<string>blue</string>
-          				<string>yellow</string>
-          			</array>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Font size</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>13.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>fontSize</string>
-          			<key>max</key>
-          			<real>30.0</real>
-          			<key>min</key>
-          			<real>8.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>footerText</key>
-          			<string>Default sits just below the status bar. Lower the value to move it up onto the status bar.</string>
-          			<key>label</key>
-          			<string>Vertical position</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>50.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>yOffset</string>
-          			<key>max</key>
-          			<real>160.0</real>
-          			<key>min</key>
-          			<real>0.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Side margin</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>24.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>sideInset</string>
-          			<key>max</key>
-          			<real>120.0</real>
-          			<key>min</key>
-          			<real>0.0</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          		<dict>
-          			<key>cell</key>
-          			<string>PSGroupCell</string>
-          			<key>label</key>
-          			<string>Opacity</string>
-          		</dict>
-          		<dict>
-          			<key>PostNotification</key>
-          			<string>local.mayhud.reload</string>
-          			<key>cell</key>
-          			<string>PSSliderCell</string>
-          			<key>default</key>
-          			<real>1.0</real>
-          			<key>defaults</key>
-          			<string>local.mayhud</string>
-          			<key>key</key>
-          			<string>opacity</string>
-          			<key>max</key>
-          			<real>1.0</real>
-          			<key>min</key>
-          			<real>0.1</real>
-          			<key>showValue</key>
-          			<true/>
-          		</dict>
-          	</array>
-          	<key>title</key>
-          	<string>MayHUD</string>
-          </dict>
-          </plist>
+          cat > icon.b64 <<'MAYEOF'
+          iVBORw0KGgoAAAANSUhEUgAAADoAAAA6CAMAAADWZboaAAAAwFBMVEXy+P7k8P358LP78ILX6/zF5PzD4vb31r/yxbTuzIfsupq22/qs2Pqo1Pm0z+zMxqyc0/mZzfeE0Pp9zPqJxveHwO17wfZ4uvNvy/ppyPlnxPhxufNdxPpYwPlLvvk0uPfmrZzSqZjQnorTi4iznJJ8ocazhXGJgodHq/IyqfQrq/gupPQ6oO4toPM8lNnqW2vcOT3YLS3VJiPUIhrQIBrQHRfQGBKfbmZ4Z2i/NjtkQkPLGxTKGBDKFw/GFxCzFQ1MbVbTAAAG/UlEQVR42m2WiZaqSBBE8bkAgrIp2tAgO4iCG4pLt/7/X01kAXa/mYnjAZW6FVlbJpw8+ZFMmqjaRFZndmbPZqadOTOmuWkumGwIN9M0uQZVSbhrs7k2s23TdIpt5th2VmQNOmtRRuKDfwjVmPBD0ww7KR0325KK7TbLyPsXatutK/7gtBnM6YEdKbFjB/24iBPCWtkdaXZkFJv4DVc4ZPYiit1M7ItR1O8nkZiCXBcQrBH1zPwhF3Y8HscLU5MnHLXIHF+M0n4j9FButts0zrKSbDOM3HyPdGH7gjCO5pIkMXRbRIQ0+tOP8vWmvF/TKEUfBWJadOiCTAVB8aKpnjG0IPQtMS3LLdBrem1cFzTlJnVgL+YgPd8Porho0JhZKqLCJIpBegWZphtCwZrN2s6nigBPHwrSNyowaKrwfE/p96OiQfFos1lnNsHaXGnBIPCDuGjRIp4SB/GwFqNie2VsFMcIfpNljmPEgcDIKIqCIMLEN+imiBVimqkSy7y834nkeWE89qN4Tss59jw2yiTBhYPYDOdxN0d/oH5SAL1H0dX3FYEHT26eECSkug6CkO/QTdytjBiIsBZjQj2vTgISdSB4Y59x9T0JwmTQoUUa1eIfMcT8lF4apylDhXFapilzSoLE85LQ9wLPZ7+jSCF0A+VpP4jLQCytP9M8L/Irxsp7cb7ZlCW6qpM68YIkDCgMz1f8IEHIG8wRGgRRmedxms/5cblZFxQvH6T5Gmdni77KFHNTBz46CIj3gxYtABVwADPn+XG23tLsCiHsbqS0zLE0YY0VRciIoK4TjHXDtM2b22YteDvSLRSE5Ha6fDMdMWaKl6YsoA2AofZatFW+TffV4wKdn/uwfpyhx+Pr+fy+pemVTVcSjrge019oXu5Pl/O5Yro8qup0qsB+fT+fz1vplmkcYaF6vcFgMBwMuH+R1fnU6nhkt9b29bpNDRXL2eMIHUK/0e0eDRuq04l8me3rlQwlzA2FykiJ26zXDbjO0yPzBHE4HH7oqkVv094bHVGWWGN11sDXOZkyEuB+fzi0/Kkd7OsV/phKLME4FmwBd6YHRv6wVTNYsu0xtCFlmbOknpZlhNan8+t8Or7u+1YMPXXo83Ub9dgUjcAh3XM0WzMb6PZ2ed0up9cd6G73Rqs3+nwqzFOSmmrBsa9Zvs6z/eX1OgF97Xce9hSxzPQH9clTasqFOuGGsjYzKN7ycH5eLqfH67DfCRzH7xjKPL/YPDGUSJWRMmqOuV436Pdpf6gupyPi9bD5CcXKgGT7mNChJDOwcZVl1WnQfTgWxl64vx0P2P/hDmMl05YEelRktalrJI3DNE80GiuOG5PghTROFm/FtlKjr8d++ptUOVVWbRlsxndCTQkSsjydq/OlI78f1W6qzSyzraeqzDmf7mpmZrnyC0XcQUJn/HhpTDFRj/MxRNOVhWGqE0nC9l/luWO773AbFNmXZZLb5dGRVbWP89Vq5brmRBphD8vciimfBj7Pd0m3YZG76gcL+OvxqDB3NiPdpcZeNswWXSnimA/q+y+SoTdCyRP7OkQzvTd0HFU2LWfldq6iyPOimPAtyMiwQckTB2IXo5nO9ZY6NobsqMMGdeaggAZvS6ouSX0Figk6H2mhEa066PWkAbYjJf8GdRWxFoS+WHtvS6TMBn08ztVO2MHUnYAcSgOwSDMtmqPaoNbU14CBHlL09Q7y/iTT6sALu1CTZcorhkRZDX206CpKUKvqex14LFY/uramiLY6h1y4U2RJ0rWlpXEc9QCYoa67Lq8oM6hsDA3qK2V4mAKtTgdB2Hk4MeZy4hgDrgdyNBoNOddli+W6WYoKiBKGRM0sQd4vj8fxcNyHYTjVTcuSJVkasjRBL4fcp2PIn4x1U7y1XGsS1VGQL6Tx4x4rGvofjmtZswl7kVRnhoGXMI7GrLlOw9Yte6XwQVbYRFjRMLRdx3Fcx7IsepmxHBI3RG5auuy749I7D1HY+a/XgypIc3bjtgFkqG8UiUb/bP79tD4NaTQdhSyHMsEUaOR8Op+dLIuuhC5xpQ9+GZomUaJUUxy3liQ0+vxfcUvdkCV9yfr7MIylhmlYpm+URmrhidW6dTdCh0NM+FAyPlrp+tJYfsRgqWrANNI//iMLH4sbStpE03XjY9no44NdFgj6cINlbOjNo7bBx7LjOVWVe5Kuq6rRPFKlCS5DVVenShIOelJP6nr9l7jlhM4PNrNk6IaBzc1hs2CzjbBvkmhID5YGqbmyb0w6Z6AJK34DTZoYKntJwNGi/d1TaJMPVDRWEZnxl5ARJ6MhuqZqi1VRBwyhOiTRyaJHIwyJtVARlqzqNDi6TIDSVkTKQGt1SMVzIFEhwwrjeIyoQE2a3giQRkik9Bgp9R+LN4/Uxh85HAAAAABJRU5ErkJggg==
           MAYEOF
-          cat > PrefsEntry.plist <<'MAYEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-          	<key>entry</key>
-          	<dict>
-          		<key>bundle</key>
-          		<string>MayHUDPrefs</string>
-          		<key>cell</key>
-          		<string>PSLinkCell</string>
-          		<key>detail</key>
-          		<string>MHRootListController</string>
-          		<key>isController</key>
-          		<true/>
-          		<key>label</key>
-          		<string>MayHUD</string>
-          	</dict>
-          </dict>
-          </plist>
-          MAYEOF
-          cat > PrefsInfo.plist <<'MAYEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-          	<key>CFBundleDevelopmentRegion</key>
-          	<string>en</string>
-          	<key>CFBundleExecutable</key>
-          	<string>MayHUDPrefs</string>
-          	<key>CFBundleIdentifier</key>
-          	<string>local.mayhudprefs</string>
-          	<key>CFBundleInfoDictionaryVersion</key>
-          	<string>6.0</string>
-          	<key>CFBundleName</key>
-          	<string>MayHUDPrefs</string>
-          	<key>CFBundlePackageType</key>
-          	<string>BNDL</string>
-          	<key>CFBundleShortVersionString</key>
-          	<string>0.1.0</string>
-          	<key>CFBundleVersion</key>
-          	<string>1</string>
-          	<key>NSPrincipalClass</key>
-          	<string>MHRootListController</string>
-          </dict>
-          </plist>
-          MAYEOF
-          ls -la
+          python3 -c "import base64;open('icon.png','wb').write(base64.b64decode(open('icon.b64').read()))"
+          python3 gen_prefs.py
+          ls -la bundle | head -50
 
       - name: Install tools
         run: brew install ldid dpkg
@@ -1477,11 +796,11 @@ jobs:
             mkdir -p "$B"
             cp MayHUDPrefs "$B/MayHUDPrefs"
             chmod 755 "$B/MayHUDPrefs"
-            cp PrefsInfo.plist "$B/Info.plist"
-            cp RootEN.plist RootRU.plist "$B/"
-            cp PrefsEntry.plist pkg/Library/PreferenceLoader/Preferences/MayHUD.plist
+            cp bundle/Info.plist bundle/Root_*.plist bundle/Set*_*.plist "$B/"
+            cp icon.png "$B/icon.png"
+            cp bundle/PrefsEntry.plist pkg/Library/PreferenceLoader/Preferences/MayHUD.plist
           else
-            cp PrefsFallback.plist pkg/Library/PreferenceLoader/Preferences/MayHUD.plist
+            cp bundle/PrefsFallback.plist pkg/Library/PreferenceLoader/Preferences/MayHUD.plist
           fi
           cp control pkg/DEBIAN/control
           echo "Installed-Size: $(du -sk pkg/Library | cut -f1)" >> pkg/DEBIAN/control
