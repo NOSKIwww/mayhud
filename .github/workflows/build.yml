@@ -56,8 +56,14 @@ jobs:
 
           static void loadPrefs(void) {
               CFPreferencesAppSynchronize(kDomain);
-              CFDictionaryRef d = CFPreferencesCopyMultiple(NULL, kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-              gP = d ? (__bridge_transfer NSDictionary *)d : @{};
+              NSMutableDictionary *m = [NSMutableDictionary dictionary];
+              CFArrayRef keys = CFPreferencesCopyKeyList(kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+              if (keys) {
+                  CFDictionaryRef d = CFPreferencesCopyMultiple(keys, kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+                  if (d) [m addEntriesFromDictionary:(__bridge_transfer NSDictionary *)d];
+                  CFRelease(keys);
+              }
+              gP = m;
           }
 
           #pragma mark - IOKit battery info (loaded dynamically)
