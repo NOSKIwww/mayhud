@@ -63,6 +63,9 @@ jobs:
                   if (d) [m addEntriesFromDictionary:(__bridge_transfer NSDictionary *)d];
                   CFRelease(keys);
               }
+              NSDictionary *file = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/local.mayhud.plist"];
+              if ([file isKindOfClass:NSDictionary.class])
+                  for (id k in file) if (!m[k]) m[k] = file[k];
               gP = m;
           }
 
@@ -114,6 +117,11 @@ jobs:
 
           #pragma mark - Network speed
 
+          struct mh_if_data {
+              uint8_t  ifi_type, ifi_typelen, ifi_physical, ifi_addrlen, ifi_hdrlen, ifi_recvquota, ifi_xmitquota, ifi_unused1;
+              uint32_t ifi_mtu, ifi_metric, ifi_baudrate, ifi_ipackets, ifi_ierrors, ifi_opackets, ifi_oerrors, ifi_collisions, ifi_ibytes, ifi_obytes;
+          };
+
           static double gDown[2], gUp[2];                 // 0 = Wi-Fi, 1 = cellular
           static uint32_t gPrevIn[2], gPrevOut[2];
           static NSTimeInterval gPrevT;
@@ -122,26 +130,26 @@ jobs:
           static void sampleNet(void) {
               struct ifaddrs *list = NULL;
               if (getifaddrs(&list) != 0) return;
-              uint32_t in[2] = {0, 0}, out[2] = {0, 0};
+              uint32_t rxb[2] = {0, 0}, txb[2] = {0, 0};
               for (struct ifaddrs *a = list; a; a = a->ifa_next) {
                   if (!a->ifa_addr || a->ifa_addr->sa_family != AF_LINK || !a->ifa_data) continue;
                   int idx = -1;
                   if (strcmp(a->ifa_name, "en0") == 0) idx = 0;
                   else if (strncmp(a->ifa_name, "pdp_ip", 6) == 0) idx = 1;
                   if (idx < 0) continue;
-                  struct if_data *d = (struct if_data *)a->ifa_data;
-                  in[idx] += d->ifi_ibytes;
-                  out[idx] += d->ifi_obytes;
+                  struct mh_if_data *d = (struct mh_if_data *)a->ifa_data;
+                  rxb[idx] += d->ifi_ibytes;
+                  txb[idx] += d->ifi_obytes;
               }
               freeifaddrs(list);
               NSTimeInterval now = CACurrentMediaTime();
               if (gHavePrev && now - gPrevT > 0.2) {
                   for (int i = 0; i < 2; i++) {
-                      gDown[i] = (double)(uint32_t)(in[i] - gPrevIn[i]) / (now - gPrevT);
-                      gUp[i]   = (double)(uint32_t)(out[i] - gPrevOut[i]) / (now - gPrevT);
+                      gDown[i] = (double)(uint32_t)(rxb[i] - gPrevIn[i]) / (now - gPrevT);
+                      gUp[i]   = (double)(uint32_t)(txb[i] - gPrevOut[i]) / (now - gPrevT);
                   }
               }
-              for (int i = 0; i < 2; i++) { gPrevIn[i] = in[i]; gPrevOut[i] = out[i]; }
+              for (int i = 0; i < 2; i++) { gPrevIn[i] = rxb[i]; gPrevOut[i] = txb[i]; }
               gPrevT = now;
               gHavePrev = YES;
           }
@@ -430,6 +438,28 @@ jobs:
               for (int k = 0; k < NSETS; k++) renderSet(k);
           }
 
+          static UILabel *gToast;
+          static void toast(NSString *t) {
+              if (!gWin) return;
+              if (!gToast) {
+                  gToast = [UILabel new];
+                  gToast.font = [UIFont boldSystemFontOfSize:12];
+                  gToast.textColor = UIColor.whiteColor;
+                  gToast.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+                  gToast.textAlignment = NSTextAlignmentCenter;
+                  gToast.layer.cornerRadius = 8;
+                  gToast.layer.masksToBounds = YES;
+                  [gWin.rootViewController.view addSubview:gToast];
+              }
+              [gToast.layer removeAllAnimations];
+              gToast.text = t;
+              CGSize sz = [gToast sizeThatFits:CGSizeMake(320, 40)];
+              CGFloat w = sz.width + 20;
+              gToast.frame = CGRectMake((UIScreen.mainScreen.bounds.size.width - w) / 2, 105, w, 26);
+              gToast.alpha = 1;
+              [UIView animateWithDuration:0.4 delay:4 options:0 animations:^{ gToast.alpha = 0; } completion:nil];
+          }
+
           static void applyPrefs(void) {
               if (!gWin) return;
               loadPrefs();
@@ -439,7 +469,10 @@ jobs:
           }
 
           static void onReload(CFNotificationCenterRef c, void *o, CFNotificationName n, const void *obj, CFDictionaryRef u) {
-              dispatch_async(dispatch_get_main_queue(), ^{ applyPrefs(); });
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  applyPrefs();
+                  toast([NSString stringWithFormat:@"MayHUD: settings updated (%lu)", (unsigned long)gP.count]);
+              });
           }
 
           #pragma mark - Setup
@@ -473,6 +506,7 @@ jobs:
               [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
               gWin.hidden = NO;
               applyPrefs();
+              toast([NSString stringWithFormat:@"MayHUD 0.2.1 · %lu settings loaded", (unsigned long)gP.count]);
 
               CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, onReload,
                   CFSTR("local.mayhud.reload"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
@@ -746,7 +780,7 @@ jobs:
           cat > control <<'MAYEOF'
           Package: local.mayhud
           Name: MayHUD
-          Version: 0.2.0
+          Version: 0.2.1
           Architecture: iphoneos-arm64e
           Description: Helium-style widget sets (date, time, text, network speed, temperature, battery, weather) drawn inside SpringBoard, with a full settings pane in the Settings app.
           Maintainer: Local Build
